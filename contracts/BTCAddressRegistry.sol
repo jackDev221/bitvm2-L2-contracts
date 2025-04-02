@@ -244,7 +244,6 @@ contract BTCAddressRegistry {
                 bool isLowercase = (char >= 0x61 && char <= 0x7A); // a-z
                 bool isUppercase = (char >= 0x41 && char <= 0x5A); // A-Z
                 bool isDigit = (char >= 0x30 && char <= 0x39); // 0-9
-                // 不允许使用容易混淆的字符：0/O, 1/I/l
 
                 if (!(isLowercase || isUppercase || isDigit)) {
                     isValid = false;

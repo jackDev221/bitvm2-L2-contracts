@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity >=0.8.0 <0.9.0;
-import "hardhat/console.sol";
 
-import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {BTCAddressRegistry} from "./BTCAddressRegistry.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
-contract GoatHTLC {
+contract GoatHTLC is BTCAddressRegistry {
     using SafeERC20 for IERC20;
     constructor() {}
 
     enum TransferStatus {
         Null,
         Pending,
-        Confirmed,
+        Claim,
         Refunded
     }
     struct Transfer {
@@ -20,87 +20,56 @@ contract GoatHTLC {
         address receiver;
         address token;
         uint256 amount;
-        bytes32 hashlock; // hash of the preimage
-        uint64 timelock; // UNIX timestamp seconds - locked UNTIL this time
+        bytes32 hashLock; // hash of the preimage
+        uint64 timeLock; // UNIX timestamp seconds - locked UNTIL this time
         TransferStatus status;
+    }
+
+    struct TransferInParams {
+        address dstEthAddr;
+        address token;
+        uint256 amount;
+        uint32 secretLength;
+        bytes32 hashLock;
+        uint64 timeLock;
+        NetworkType network;
+        BTCAddressType addrType;
+        string claimBtcAddr;
     }
 
     mapping(bytes32 => Transfer) public transfers;
 
-    event LogNewTransferOut(
-        bytes32 transferId,
-        address sender,
-        address receiver,
-        address token,
-        uint256 amount,
-        bytes32 hashlock, // hash of the preimage
-        uint64 timelock, // UNIX timestamp seconds - locked UNTIL this time
-        uint64 dstChainId,
-        address dstAddress
-    );
     event LogNewTransferIn(
         bytes32 transferId,
-        address sender,
-        address receiver,
+        address indexed sender,
+        address indexed receiver,
         address token,
         uint256 amount,
-        bytes32 hashlock, // hash of the preimage
-        uint64 timelock, // UNIX timestamp seconds - locked UNTIL this time
-        uint64 srcChainId,
-        bytes32 srcTransferId // outbound transferId at src chain
+        string  refundBtcAddr
     );
     event LogTransferConfirmed(bytes32 transferId, bytes32 preimage);
     event LogTransferRefunded(bytes32 transferId);
 
-    /**
-     * @dev transfer sets up a new outbound transfer with hash time lock.
-     */
-    function transferOut(
-        address _bridge,
-        address _token,
-        uint256 _amount,
-        bytes32 _hashlock,
-        uint64 _timelock,
-        uint64 _dstChainId,
-        address _dstAddress
-    ) external {
-        bytes32 transferId = _transfer(_bridge, _token, _amount, _hashlock, _timelock);
-        emit LogNewTransferOut(
-            transferId,
-            msg.sender,
-            _bridge,
-            _token,
-            _amount,
-            _hashlock,
-            _timelock,
-            _dstChainId,
-            _dstAddress
-        );
-    }
-
-    /**
+      /**
      * @dev transfer sets up a new inbound transfer with hash time lock.
      */
     function transferIn(
-        address _dstAddress,
-        address _token,
-        uint256 _amount,
-        bytes32 _hashlock,
-        uint64 _timelock,
-        uint64 _srcChainId,
-        bytes32 _srcTransferId
-    ) external {
-        bytes32 transferId = _transfer(_dstAddress, _token, _amount, _hashlock, _timelock);
+        TransferInParams memory _params
+    ) external validateAddressWithNetwork(_params.network, _params.claimBtcAddr) {
+        // TODO feeRate check
+        string memory refundBtcAddr = getBTCAddressByType(_params.dstEthAddr, _params.network,
+            _params.addrType);
+        require(bytes(refundBtcAddr).length > 0, "No btc address found");
+
+        bytes32 transferId = _transfer(_params.dstEthAddr, _params.token, _params.amount,
+            _params.hashLock, _params.timeLock);
         emit LogNewTransferIn(
             transferId,
             msg.sender,
-            _dstAddress,
-            _token,
-            _amount,
-            _hashlock,
-            _timelock,
-            _srcChainId,
-            _srcTransferId
+            _params.dstEthAddr,
+            _params.token,
+            _params.amount,
+            refundBtcAddr
         );
     }
 
@@ -110,13 +79,13 @@ contract GoatHTLC {
      * @param _transferId Id of pending transfer.
      * @param _preimage key for the hashlock
      */
-    function redeem(bytes32 _transferId, bytes32 _preimage) external {
+    function claim(bytes32 _transferId, bytes32 _preimage) external {
         Transfer memory t = transfers[_transferId];
 
         require(t.status == TransferStatus.Pending, "not pending transfer");
-        require(t.hashlock == keccak256(abi.encodePacked(_preimage)), "incorrect preimage");
+        require(t.hashLock == keccak256(abi.encodePacked(_preimage)), "incorrect preimage");
 
-        transfers[_transferId].status = TransferStatus.Confirmed;
+        transfers[_transferId].status = TransferStatus.Claim;
 
         IERC20(t.token).safeTransfer(t.receiver, t.amount);
         emit LogTransferConfirmed(_transferId, _preimage);
@@ -131,7 +100,7 @@ contract GoatHTLC {
         Transfer memory t = transfers[_transferId];
 
         require(t.status == TransferStatus.Pending, "not pending transfer");
-        require(t.timelock <= block.timestamp, "timelock not yet passed");
+        require(t.timeLock <= block.timestamp, "timelock not yet passed");
 
         transfers[_transferId].status = TransferStatus.Refunded;
 
@@ -146,17 +115,15 @@ contract GoatHTLC {
         address _receiver,
         address _token,
         uint256 _amount,
-        bytes32 _hashlock,
-        uint64 _timelock
+        bytes32 _hashLock,
+        uint64 _timeLock
     ) private returns (bytes32 transferId) {
         require(_amount > 0, "invalid amount");
-        console.log("timeLock input %s need %s", _timelock,  block.timestamp);
-        require(_timelock > block.timestamp, "invalid timelock");
+        require(_timeLock > block.timestamp, "invalid timelock");
 
-        transferId = keccak256(abi.encodePacked(msg.sender, _receiver, _hashlock, block.chainid));
+        transferId = keccak256(abi.encodePacked(msg.sender, _receiver, _hashLock, block.chainid));
         require(transfers[transferId].status == TransferStatus.Null, "transfer exists");
 
-        console.log("safeTransferFrom args %s, %s, %s",msg.sender, address(this), _amount);
         IERC20(_token).safeTransferFrom(msg.sender, address(this), _amount);
 
         transfers[transferId] = Transfer(
@@ -164,8 +131,8 @@ contract GoatHTLC {
             _receiver,
             _token,
             _amount,
-            _hashlock,
-            _timelock,
+            _hashLock,
+            _timeLock,
             TransferStatus.Pending
         );
         return transferId;
